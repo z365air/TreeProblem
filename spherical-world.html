@@ -453,9 +453,11 @@ function tick() {
   const speed = 0.03 * sprint;    // UV units / second
   if (fwd || strafe) {
     const n = 1 / Math.hypot(fwd, strafe);
-    // forward in UV: (-sin yaw, -cos yaw); right: (cos yaw, -sin yaw)
+    // UV directions derived from the shader's projection evaluated at the
+    // camera-forward and camera-right horizon points, so walking "into" what
+    // you see on the sphere moves the minimap dot along the same line.
     const fx = -Math.sin(yaw) * fwd * n + Math.cos(yaw) * strafe * n;
-    const fy = -Math.cos(yaw) * fwd * n - Math.sin(yaw) * strafe * n;
+    const fy =  Math.cos(yaw) * fwd * n + Math.sin(yaw) * strafe * n;
     playerUV.x += fx * speed * dt;
     playerUV.y += fy * speed * dt;
     playerUV.x -= Math.floor(playerUV.x);
