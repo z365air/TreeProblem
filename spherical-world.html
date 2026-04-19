@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Spherical Viewport Prototype</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; color: #eee; font-family: monospace; }
+  canvas.main { display: block; }
+
+  #hud {
+    position: fixed; inset: 0; pointer-events: none;
+  }
+
+  #crosshair {
+    position: absolute; left: 50%; top: 50%;
+    width: 18px; height: 18px; margin-left: -9px; margin-top: -9px;
+    border: 1px solid rgba(255,255,255,0.8);
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.6) inset;
+  }
+  #crosshair::before, #crosshair::after {
+    content: ''; position: absolute; background: rgba(255,255,255,0.9);
+  }
+  #crosshair::before { left: 50%; top: -6px; width: 1px; height: 6px; margin-left: -0.5px; }
+  #crosshair::after  { top: 50%; left: -6px; height: 1px; width: 6px; margin-top: -0.5px; }
+
+  #mapOverlay {
+    position: absolute; left: 12px; top: 12px;
+    width: 380px; height: 212px;
+    border: 1px solid rgba(255,255,255,0.35);
+    opacity: 0.65;
+    background: #000;
+  }
+  #mapOverlay canvas { width: 100%; height: 100%; display: block; }
+  #playerDot {
+    position: absolute; width: 10px; height: 10px;
+    border: 2px solid #ff3860;
+    background: rgba(255, 56, 96, 0.5);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  #coverageBox {
+    position: absolute;
+    border: 1px solid #ff3860;
+    pointer-events: none;
+    box-shadow: 0 0 0 1px rgba(255,56,96,0.25) inset;
+  }
+
+  #instructions {
+    position: absolute; right: 12px; bottom: 12px;
+    padding: 10px 12px; background: rgba(0,0,0,0.55);
+    border: 1px solid rgba(255,255,255,0.2);
+    font-size: 12px; line-height: 1.5;
+  }
+  #clickToStart {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.6); font-size: 18px;
+    pointer-events: auto; cursor: pointer;
+  }
+  #clickToStart.hidden { display: none; }
+</style>
+</head>
+<body>
+<canvas class="main" id="gl"></canvas>
+
+<div id="hud">
+  <div id="crosshair"></div>
+  <div id="mapOverlay">
+    <canvas id="mapCanvas" width="1600" height="900"></canvas>
+    <div id="coverageBox"></div>
+    <div id="playerDot"></div>
+  </div>
+  <div id="instructions">
+    <b>Controls</b><br/>
+    Mouse — look<br/>
+    W / S — forward / back<br/>
+    A / D — strafe<br/>
+    Shift — sprint<br/>
+    Space — jump<br/>
+    Esc — release mouse
+  </div>
+  <div id="clickToStart">Click to play</div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------------------------------------------------------------------
+// 1. Procedural "Parthan Edgelands"–style authored map drawn to a canvas
+// ---------------------------------------------------------------------------
+const MAP_W = 1600, MAP_H = 900;
+const mapCanvas = document.getElementById('mapCanvas');
+mapCanvas.width = MAP_W; mapCanvas.height = MAP_H;
+const mctx = mapCanvas.getContext('2d');
+
+// Named settlements in map-UV (origin = bottom-left, as in three.js textures)
+const SETTLEMENTS = [
+  { name: "Emmon's Field",    uv: [0.19, 0.60], color: '#b22' },
+  { name: "Downriver Wharf",  uv: [0.37, 0.55], color: '#b22' },
+  { name: "Haedon's Hamlet",  uv: [0.46, 0.80], color: '#b22' },
+  { name: "Cragwood Canyon",  uv: [0.70, 0.90], color: '#d60' },
+  { name: "The Ring",         uv: [0.65, 0.70], color: '#888' },
+  { name: "Greywood Hills",   uv: [0.92, 0.88], color: '#d60' },
+  { name: "Soggwood Stand",   uv: [0.92, 0.62], color: '#d60' },
+  { name: "Riverside",        uv: [0.78, 0.53], color: '#888' },
+  { name: "Aust",             uv: [0.47, 0.38], color: '#3a3' },
+  { name: "Candlehearth",     uv: [0.10, 0.35], color: '#222' },
+  { name: "Briggand's Hill",  uv: [0.40, 0.18], color: '#3a3' },
+  { name: "Old Ambervale",    uv: [0.92, 0.33], color: '#222' },
+  { name: "Ambervale Road",   uv: [0.70, 0.20], color: '#3a3' },
+];
+
+// Two winding rivers, defined as polylines in map-UV space
+const RIVERS = [
+  [[0.05, 0.52],[0.22, 0.55],[0.36, 0.50],[0.45, 0.42],[0.55, 0.30],
+   [0.62, 0.22],[0.72, 0.18],[0.85, 0.17],[1.00, 0.15]],
+  [[0.00, 0.22],[0.12, 0.28],[0.24, 0.26],[0.35, 0.17],[0.48, 0.12]],
+];
+
+// Bridges sit on river crossings
+const BRIDGES = [
+  { uv: [0.33, 0.51] },
+  { uv: [0.60, 0.24] },
+  { uv: [0.80, 0.17] },
+  { uv: [0.18, 0.27] },
+];
+
+// --- draw the map ---------------------------------------------------------
+// base parchment
+mctx.fillStyle = '#d9c292';
+mctx.fillRect(0, 0, MAP_W, MAP_H);
+// subtle noise
+for (let i = 0; i < 4000; i++) {
+  mctx.fillStyle = `rgba(150,120,80,${Math.random()*0.08})`;
+  mctx.fillRect(Math.random()*MAP_W, Math.random()*MAP_H, 2, 2);
+}
+
+// rivers (blue strokes). Canvas has origin top-left, so flip V.
+function uvToPx([u,v]) { return [u * MAP_W, (1 - v) * MAP_H]; }
+mctx.strokeStyle = '#6a8cb0';
+mctx.lineWidth = 14; mctx.lineCap = 'round'; mctx.lineJoin = 'round';
+for (const r of RIVERS) {
+  mctx.beginPath();
+  r.forEach((p, i) => {
+    const [x,y] = uvToPx(p);
+    if (i === 0) mctx.moveTo(x,y); else mctx.lineTo(x,y);
+  });
+  mctx.stroke();
+}
+mctx.strokeStyle = '#88aacc'; mctx.lineWidth = 8;
+for (const r of RIVERS) {
+  mctx.beginPath();
+  r.forEach((p, i) => {
+    const [x,y] = uvToPx(p);
+    if (i === 0) mctx.moveTo(x,y); else mctx.lineTo(x,y);
+  });
+  mctx.stroke();
+}
+
+// forests: lots of little pine-cone triangles
+const TREE_POINTS = [];
+const RNG = mulberry32(1337);
+for (let i = 0; i < 1600; i++) {
+  const u = RNG(), v = RNG();
+  // thin around rivers
+  if (nearRiver(u, v, 0.03)) continue;
+  TREE_POINTS.push([u, v]);
+}
+function mulberry32(a){return function(){let t=a+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296;};}
+function nearRiver(u, v, tol) {
+  for (const r of RIVERS) {
+    for (let i = 0; i < r.length-1; i++) {
+      const [ax,ay] = r[i], [bx,by] = r[i+1];
+      const dx = bx-ax, dy = by-ay;
+      const t = Math.max(0, Math.min(1, ((u-ax)*dx + (v-ay)*dy)/(dx*dx+dy*dy+1e-9)));
+      const px = ax + t*dx, py = ay + t*dy;
+      const d = Math.hypot(u-px, v-py);
+      if (d < tol) return true;
+    }
+  }
+  return false;
+}
+
+for (const [u,v] of TREE_POINTS) {
+  const [x,y] = uvToPx([u,v]);
+  drawPine(mctx, x, y, 9 + RNG()*6);
+}
+function drawPine(ctx, x, y, s) {
+  ctx.fillStyle = '#3f5e3a';
+  ctx.beginPath(); ctx.moveTo(x, y-s); ctx.lineTo(x+s*0.7, y+s*0.5); ctx.lineTo(x-s*0.7, y+s*0.5); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#4b2a14';
+  ctx.fillRect(x-1.2, y+s*0.45, 2.4, s*0.25);
+}
+
+// settlements: labeled flag + rooftop block
+for (const s of SETTLEMENTS) {
+  const [x,y] = uvToPx(s.uv);
+  mctx.fillStyle = '#7a5a35'; mctx.fillRect(x-22, y-6, 44, 12);
+  mctx.fillStyle = '#000'; mctx.font = 'bold 11px monospace';
+  mctx.textAlign = 'center'; mctx.textBaseline = 'middle';
+  mctx.fillText(s.name.slice(0,14), x, y);
+  mctx.fillStyle = s.color;
+  mctx.fillRect(x-2, y-22, 14, 10);
+  mctx.strokeStyle = '#222'; mctx.lineWidth = 1;
+  mctx.beginPath(); mctx.moveTo(x-2, y-22); mctx.lineTo(x-2, y-6); mctx.stroke();
+}
+
+// title cartouche
+mctx.fillStyle = '#000'; mctx.font = 'bold 34px serif'; mctx.textAlign = 'left';
+mctx.fillText('The Parthan Edgelands', 40, 60);
+mctx.font = 'italic 16px serif';
+mctx.fillText('year 846 by Elder Reckoning', 40, 86);
+
+// ---------------------------------------------------------------------------
+// 2. Three.js scene
+// ---------------------------------------------------------------------------
+const R = 1.0;                 // sphere radius (visual)
+const U_SPAN = 0.14;           // UV distance from pole to antipode (half rect width)
+const EYE_HEIGHT = 0.05 * R;   // camera offset above pole
+
+const glCanvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87a6c4);
+scene.fog = new THREE.Fog(0x87a6c4, R*0.6, R*1.5);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.001, 100);
+camera.rotation.order = 'YXZ';
+camera.position.set(0, R + EYE_HEIGHT, 0);
+
+// --- map texture from our drawn canvas ---
+const mapTex = new THREE.CanvasTexture(mapCanvas);
+mapTex.wrapS = mapTex.wrapT = THREE.RepeatWrapping;
+mapTex.colorSpace = THREE.SRGBColorSpace;
+mapTex.anisotropy = 8;
+
+// --- player state in map-UV ---
+const playerUV = new THREE.Vector2(0.14, 0.13);  // purple-X starting position
+let yaw = 0, pitch = 0;
+let vy = 0; let camYOffset = 0; // jump
+
+// --- sphere (ground) shader ---
+const groundUniforms = {
+  uMap:      { value: mapTex },
+  uPlayerUV: { value: playerUV },
+  uSpan:     { value: U_SPAN },
+  uHorizon:  { value: 0.55 },
+  uFogColor: { value: new THREE.Color(0x87a6c4) },
+};
+const groundMat = new THREE.ShaderMaterial({
+  uniforms: groundUniforms,
+  vertexShader: `
+    varying vec3 vN;
+    void main() {
+      vN = normalize(position);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec3 vN;
+    uniform sampler2D uMap;
+    uniform vec2  uPlayerUV;
+    uniform float uSpan;
+    uniform float uHorizon;
+    uniform vec3  uFogColor;
+    #define PI 3.141592653589793
+    void main() {
+      float rho   = acos(clamp(vN.y, -1.0, 1.0)) / PI;
+      float alpha = atan(vN.x, -vN.z);        // -Z = forward matches camera default
+      vec2 off = vec2(sin(alpha), cos(alpha)) * rho * uSpan;
+      vec2 uv  = fract(uPlayerUV + off);
+      vec3 col = texture2D(uMap, uv).rgb;
+      float fog = smoothstep(uHorizon, 1.0, rho);
+      col = mix(col, uFogColor, fog);
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+const ground = new THREE.Mesh(new THREE.SphereGeometry(R, 256, 256), groundMat);
+scene.add(ground);
+
+// --- sky dome (simple gradient) ---
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(40, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    uniforms: { top: {value: new THREE.Color(0x3a6ea6)}, bot: {value: new THREE.Color(0xbfd4e6)} },
+    vertexShader: `varying float h; void main(){ h = normalize(position).y; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `varying float h; uniform vec3 top; uniform vec3 bot; void main(){ gl_FragColor = vec4(mix(bot, top, clamp(h,0.0,1.0)), 1.0); }`,
+  })
+);
+scene.add(sky);
+
+// --- lights ---
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556677, 0.9));
+const sun = new THREE.DirectionalLight(0xffeecc, 0.9);
+sun.position.set(1, 2, 1);
+scene.add(sun);
+
+// ---------------------------------------------------------------------------
+// 3. 3D assets in map-space. Each has {uv:[u,v], type, scale, rot}
+// ---------------------------------------------------------------------------
+const ASSETS = [];
+
+// buildings at settlements
+for (const s of SETTLEMENTS) {
+  ASSETS.push({ uv: [...s.uv], type: 'building', scale: 1.0, color: 0x9c8a6b, flag: s.color });
+}
+// trees scattered (reuse tree points)
+for (const [u,v] of TREE_POINTS) {
+  if (RNG() < 0.35) ASSETS.push({ uv: [u,v], type: 'tree', scale: 0.8 + RNG()*0.7 });
+}
+// bridges
+for (const b of BRIDGES) ASSETS.push({ uv: [...b.uv], type: 'bridge' });
+
+// --- reusable geometries/materials (instanced where possible) ---
+const treeGeomTop = new THREE.ConeGeometry(0.006, 0.022, 8);
+const treeMatTop  = new THREE.MeshStandardMaterial({ color: 0x3f5e3a, roughness: 0.9 });
+const treeGeomTrunk = new THREE.CylinderGeometry(0.0015, 0.0018, 0.008, 6);
+const treeMatTrunk  = new THREE.MeshStandardMaterial({ color: 0x4b2a14, roughness: 1 });
+
+const bldgGeom = new THREE.BoxGeometry(0.02, 0.014, 0.02);
+const bldgRoofGeom = new THREE.ConeGeometry(0.016, 0.012, 4);
+const bldgMat = new THREE.MeshStandardMaterial({ color: 0xb5a07a, roughness: 0.85 });
+const bldgRoofMat = new THREE.MeshStandardMaterial({ color: 0x7a3a28, roughness: 0.9 });
+
+const bridgeGeom = new THREE.BoxGeometry(0.04, 0.003, 0.014);
+const bridgeMat  = new THREE.MeshStandardMaterial({ color: 0x6a4a2a, roughness: 0.9 });
+
+// build asset 3D objects (one per asset; keep count moderate)
+for (const a of ASSETS) {
+  const g = new THREE.Group();
+  if (a.type === 'tree') {
+    const top = new THREE.Mesh(treeGeomTop, treeMatTop);
+    top.position.y = 0.015;
+    top.scale.setScalar(a.scale);
+    const trunk = new THREE.Mesh(treeGeomTrunk, treeMatTrunk);
+    trunk.position.y = 0.004;
+    trunk.scale.setScalar(a.scale);
+    g.add(trunk); g.add(top);
+  } else if (a.type === 'building') {
+    const box = new THREE.Mesh(bldgGeom, bldgMat);
+    box.position.y = 0.007;
+    const roof = new THREE.Mesh(bldgRoofGeom, bldgRoofMat);
+    roof.position.y = 0.02; roof.rotation.y = Math.PI/4;
+    const flagMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(a.flag || '#cc2222') });
+    const flag = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.004, 0.0008), flagMat);
+    flag.position.set(0.005, 0.028, 0);
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.0004, 0.0004, 0.016, 5),
+                                new THREE.MeshStandardMaterial({ color: 0x222 }));
+    pole.position.set(0, 0.022, 0);
+    g.add(box); g.add(roof); g.add(flag); g.add(pole);
+  } else if (a.type === 'bridge') {
+    const b = new THREE.Mesh(bridgeGeom, bridgeMat);
+    b.position.y = 0.002;
+    g.add(b);
+  }
+  a.obj = g;
+  g.visible = false;
+  scene.add(g);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Projection map -> sphere
+// ---------------------------------------------------------------------------
+// shader: off = (sin α, cos α) * rho * uSpan, α = atan2(vN.x, -vN.z)
+// inverse: given offset in UV relative to player (shortest torus path),
+//   rho = |off| / uSpan ∈ [0,1]
+//   α   = atan2(off.x, off.y)
+//   θ   = rho * π
+//   unit sphere point p = (sin θ sin α, cos θ, -sin θ cos α)
+const _tmpPos = new THREE.Vector3();
+const _up = new THREE.Vector3();
+function projectAssetToSphere(asset, playerUv) {
+  let ox = asset.uv[0] - playerUv.x;
+  let oy = asset.uv[1] - playerUv.y;
+  ox -= Math.round(ox); oy -= Math.round(oy);    // torus shortest path
+  const dist = Math.hypot(ox, oy);
+  if (dist > U_SPAN * 0.85) { asset.obj.visible = false; return; }
+  asset.obj.visible = true;
+  const rho = dist / U_SPAN;
+  const alpha = Math.atan2(ox, oy);
+  const theta = rho * Math.PI;
+  const sinT = Math.sin(theta), cosT = Math.cos(theta);
+  const sinA = Math.sin(alpha), cosA = Math.cos(alpha);
+  const nx = sinT * sinA, ny = cosT, nz = -sinT * cosA;
+  asset.obj.position.set(nx * R, ny * R, nz * R);
+  _up.set(nx, ny, nz);
+  // orient so local +Y aligns with surface normal
+  asset.obj.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), _up);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Input
+// ---------------------------------------------------------------------------
+const keys = Object.create(null);
+addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'Space') e.preventDefault(); });
+addEventListener('keyup',   e => { keys[e.code] = false; });
+
+const clickToStart = document.getElementById('clickToStart');
+clickToStart.addEventListener('click', () => glCanvas.requestPointerLock());
+document.addEventListener('pointerlockchange', () => {
+  clickToStart.classList.toggle('hidden', document.pointerLockElement === glCanvas);
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== glCanvas) return;
+  yaw   -= e.movementX * 0.0022;
+  pitch -= e.movementY * 0.0022;
+  pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, pitch));
+});
+
+// ---------------------------------------------------------------------------
+// 6. HUD overlay updates
+// ---------------------------------------------------------------------------
+const mapEl = document.getElementById('mapOverlay');
+const dotEl = document.getElementById('playerDot');
+const boxEl = document.getElementById('coverageBox');
+function updateHUD() {
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  dotEl.style.left = (playerUV.x * w) + 'px';
+  dotEl.style.top  = ((1 - playerUV.y) * h) + 'px';
+  const bw = U_SPAN * 2 * w;      // coverage diameter
+  const bh = U_SPAN * 2 * h * (MAP_W/MAP_H); // square in UV → adjust aspect? keep simple
+  boxEl.style.width  = bw + 'px';
+  boxEl.style.height = bh + 'px';
+  boxEl.style.left = (playerUV.x * w - bw/2) + 'px';
+  boxEl.style.top  = ((1 - playerUV.y) * h - bh/2) + 'px';
+}
+
+// ---------------------------------------------------------------------------
+// 7. Main loop
+// ---------------------------------------------------------------------------
+const clock = new THREE.Clock();
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  // movement
+  let fwd = 0, strafe = 0;
+  if (keys['KeyW']) fwd += 1;
+  if (keys['KeyS']) fwd -= 1;
+  if (keys['KeyD']) strafe += 1;
+  if (keys['KeyA']) strafe -= 1;
+  const sprint = (keys['ShiftLeft']||keys['ShiftRight']) ? 2.5 : 1.0;
+  const speed = 0.03 * sprint;    // UV units / second
+  if (fwd || strafe) {
+    const n = 1 / Math.hypot(fwd, strafe);
+    // forward in UV: (-sin yaw, -cos yaw); right: (cos yaw, -sin yaw)
+    const fx = -Math.sin(yaw) * fwd * n + Math.cos(yaw) * strafe * n;
+    const fy = -Math.cos(yaw) * fwd * n - Math.sin(yaw) * strafe * n;
+    playerUV.x += fx * speed * dt;
+    playerUV.y += fy * speed * dt;
+    playerUV.x -= Math.floor(playerUV.x);
+    playerUV.y -= Math.floor(playerUV.y);
+  }
+
+  // jump (pure visual bob)
+  if (keys['Space'] && camYOffset === 0 && vy === 0) vy = 0.55;
+  vy -= 1.6 * dt;
+  camYOffset = Math.max(0, camYOffset + vy * dt);
+  if (camYOffset === 0) vy = 0;
+
+  // apply camera
+  camera.rotation.set(pitch, yaw, 0);
+  camera.position.set(0, R + EYE_HEIGHT + camYOffset * 0.1, 0);
+
+  // project assets
+  for (const a of ASSETS) projectAssetToSphere(a, playerUV);
+
+  // HUD
+  updateHUD();
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+tick();
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>
